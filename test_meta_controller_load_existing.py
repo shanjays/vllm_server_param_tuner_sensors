@@ -78,78 +78,57 @@ def test_training_logger_stored_in_init():
         return False
 
 
-def test_exploration_agent_load_existing_true():
-    """Test that ExplorationAgent is created with load_existing=True."""
-    print("\n=== Test: ExplorationAgent created with load_existing=True ===")
+def test_direct_testing_phase_exists():
+    """Test that _run_direct_testing_phase method exists (replaces PPO exploration)."""
+    print("\n=== Test: _run_direct_testing_phase method exists ===")
     
     source = get_meta_controller_source()
     
-    # Find the _run_exploration_phase method and check for load_existing=True
-    # Looking for: ExplorationAgent(..., load_existing=True, ...)
-    pattern = r'ExplorationAgent\s*\([^)]*load_existing\s*=\s*True[^)]*\)'
-    match = re.search(pattern, source, re.DOTALL)
-    
-    if match:
-        print(f"✅ ExplorationAgent is created with load_existing=True")
-        return True
-    else:
-        print(f"❌ ExplorationAgent is NOT created with load_existing=True")
-        return False
-
-
-def test_exploration_agent_receives_training_logger():
-    """Test that ExplorationAgent receives training_logger from controller."""
-    print("\n=== Test: ExplorationAgent receives training_logger ===")
-    
-    source = get_meta_controller_source()
-    
-    # Check for training_logger parameter being passed to ExplorationAgent
-    # Looking for: ExplorationAgent(..., training_logger=..., ...)
-    pattern = r'ExplorationAgent\s*\([^)]*training_logger\s*=[^)]*\)'
-    match = re.search(pattern, source, re.DOTALL)
-    
-    if match:
-        print(f"✅ ExplorationAgent receives training_logger parameter")
-        return True
-    else:
-        print(f"❌ ExplorationAgent does NOT receive training_logger parameter")
-        return False
-
-
-def test_persistent_log_dir_format():
-    """Test that log_dir uses persistent format without timestamp."""
-    print("\n=== Test: log_dir uses persistent format ===")
-    
-    source = get_meta_controller_source()
-    
-    # Check that the new log_dir format is used: ./logs/exploration_agent/tokens_{token_count}/
-    # This should NOT have a timestamp pattern like: exploration_{timestamp}_tokens
-    persistent_pattern = r'log_dir\s*=\s*f["\']\.?/?logs/exploration_agent/tokens_'
-    match = re.search(persistent_pattern, source)
-    
-    if match:
-        print(f"✅ log_dir uses persistent format without timestamp")
-        return True
-    else:
-        print(f"❌ log_dir does NOT use persistent format")
-        return False
-
-
-def test_save_best_if_improved_called():
-    """Test that save_best_if_improved is called in _run_exploration_phase."""
-    print("\n=== Test: save_best_if_improved is called ===")
-    
-    source = get_meta_controller_source()
-    
-    # Check for agent.save_best_if_improved call in _run_exploration_phase
-    pattern = r'agent\.save_best_if_improved\s*\('
+    # Find the _run_direct_testing_phase method
+    pattern = r'def _run_direct_testing_phase\s*\('
     match = re.search(pattern, source)
     
     if match:
-        print(f"✅ save_best_if_improved is called")
+        print(f"✅ _run_direct_testing_phase method exists (PPO removed)")
         return True
     else:
-        print(f"❌ save_best_if_improved is NOT called")
+        print(f"❌ _run_direct_testing_phase method NOT found")
+        return False
+
+
+def test_profiling_worker_used_for_testing():
+    """Test that ProfilingWorker is used for direct testing."""
+    print("\n=== Test: ProfilingWorker used for direct testing ===")
+    
+    source = get_meta_controller_source()
+    
+    # Check that run_kernel_profiling is called in _run_direct_testing_phase
+    pattern = r'self\.worker\.run_kernel_profiling\.remote'
+    match = re.search(pattern, source)
+    
+    if match:
+        print(f"✅ ProfilingWorker.run_kernel_profiling is used")
+        return True
+    else:
+        print(f"❌ ProfilingWorker.run_kernel_profiling is NOT used")
+        return False
+
+
+def test_no_exploration_agent_usage():
+    """Test that ExplorationAgent is NOT used anywhere (PPO removed)."""
+    print("\n=== Test: No ExplorationAgent usage ===")
+    
+    source = get_meta_controller_source()
+    
+    # Check that ExplorationAgent is NOT instantiated
+    pattern = r'ExplorationAgent\s*\('
+    match = re.search(pattern, source)
+    
+    if not match:
+        print(f"✅ ExplorationAgent is NOT used (PPO removed)")
+        return True
+    else:
+        print(f"❌ ExplorationAgent is still used")
         return False
 
 
@@ -172,21 +151,21 @@ def test_best_configs_tracked():
 
 
 def test_config_exporter_updated():
-    """Test that config_exporter.update_best_config is called with correct params."""
-    print("\n=== Test: config_exporter.update_best_config called correctly ===")
+    """Test that config_exporter.update_best_config is called during direct testing."""
+    print("\n=== Test: config_exporter.update_best_config called ===")
     
     source = get_meta_controller_source()
     
-    # Check for config_exporter.update_best_config call with token_count, config, reward
-    # The call should be in the _run_exploration_phase method with best config from results
-    pattern = r'self\.config_exporter\.update_best_config\s*\(\s*token_count\s*=\s*token_count'
+    # Check for config_exporter.update_best_config call
+    # In the new direct testing phase, it's called with token_count, config, reward, metrics
+    pattern = r'self\.config_exporter\.update_best_config\s*\('
     match = re.search(pattern, source)
     
     if match:
-        print(f"✅ config_exporter.update_best_config called with correct parameters")
+        print(f"✅ config_exporter.update_best_config is called")
         return True
     else:
-        print(f"❌ config_exporter.update_best_config NOT called with correct parameters")
+        print(f"❌ config_exporter.update_best_config NOT called")
         return False
 
 
@@ -275,68 +254,71 @@ def test_feedback_collector_stored_in_init():
         return False
 
 
-def test_feedback_collector_record_policy_result():
-    """Test that feedback_collector.record_policy_result is called."""
-    print("\n=== Test: feedback_collector.record_policy_result is called ===")
+def test_feedback_collector_record_configuration_results():
+    """Test that feedback_collector.record_configuration_results is called."""
+    print("\n=== Test: feedback_collector.record_configuration_results is called ===")
     
     source = get_meta_controller_source()
     
-    # Check for self.feedback_collector.record_policy_result call
-    pattern = r'self\.feedback_collector\.record_policy_result\s*\('
+    # Check for self.feedback_collector.record_configuration_results call
+    pattern = r'self\.feedback_collector\.record_configuration_results\s*\('
     match = re.search(pattern, source)
     
     if match:
-        print(f"✅ feedback_collector.record_policy_result is called")
+        print(f"✅ feedback_collector.record_configuration_results is called")
         return True
     else:
-        print(f"❌ feedback_collector.record_policy_result is NOT called")
+        print(f"❌ feedback_collector.record_configuration_results is NOT called")
         return False
 
 
-def test_exploration_phase_returns_best_configs():
-    """Test that _run_exploration_phase returns best_configs."""
-    print("\n=== Test: _run_exploration_phase returns best_configs ===")
+def test_direct_testing_returns_best_configs():
+    """Test that _run_direct_testing_phase returns best_configs."""
+    print("\n=== Test: _run_direct_testing_phase returns best_configs ===")
     
     source = get_meta_controller_source()
     
-    # Check for return statement with best_configs (flexible pattern for any slice)
+    # Check for return statement with best_configs in _run_direct_testing_phase
     pattern = r'return\s+sorted_results\[[^\]]+\]\s*,\s*best_configs'
     match = re.search(pattern, source)
     
     if match:
-        print(f"✅ _run_exploration_phase returns best_configs")
+        print(f"✅ _run_direct_testing_phase returns best_configs")
         return True
     else:
-        print(f"❌ _run_exploration_phase does NOT return best_configs")
+        print(f"❌ _run_direct_testing_phase does NOT return best_configs")
         return False
 
 
 if __name__ == "__main__":
-    print("--- META CONTROLLER LOAD EXISTING TESTS ---")
+    print("--- META CONTROLLER TESTS (Direct Configuration Optimization) ---")
     
     all_passed = True
     
+    # Basic parameter tests
     all_passed &= test_training_logger_parameter_in_init()
     all_passed &= test_training_logger_default_none()
     all_passed &= test_training_logger_stored_in_init()
-    all_passed &= test_exploration_agent_load_existing_true()
-    all_passed &= test_exploration_agent_receives_training_logger()
-    all_passed &= test_persistent_log_dir_format()
-    all_passed &= test_save_best_if_improved_called()
+    
+    # Direct testing phase tests (PPO removed)
+    all_passed &= test_direct_testing_phase_exists()
+    all_passed &= test_profiling_worker_used_for_testing()
+    all_passed &= test_no_exploration_agent_usage()
+    
     all_passed &= test_best_configs_tracked()
     all_passed &= test_config_exporter_updated()
     all_passed &= test_backward_compatibility_init_signature()
     
-    # New tests for feedback_collector
+    # Feedback collector tests
     all_passed &= test_feedback_collector_parameter_in_init()
     all_passed &= test_feedback_collector_defaults_none()
     all_passed &= test_feedback_collector_stored_in_init()
-    all_passed &= test_feedback_collector_record_policy_result()
-    all_passed &= test_exploration_phase_returns_best_configs()
+    all_passed &= test_feedback_collector_record_configuration_results()
+    all_passed &= test_direct_testing_returns_best_configs()
     
     print("\n" + "="*60)
     if all_passed:
-        print("✅ ALL META CONTROLLER LOAD EXISTING TESTS PASSED")
+        print("✅ ALL META CONTROLLER TESTS PASSED")
     else:
         print("❌ ONE OR MORE TESTS FAILED")
     print("="*60)
