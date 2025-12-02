@@ -158,6 +158,24 @@ class ProfilingWorker:
         if len(self.failed_configs) > 100:
             self.failed_configs = self.failed_configs[-100:]
 
+    def _get_triton_cache_dir(self):
+        """Get the unique Triton cache directory for this worker."""
+        return f"/tmp/triton_cache_gpu{self.gpu_id}_{os.getpid()}"
+
+    def _print_truncated_output(self, content, label, max_chars=2000):
+        """Print output with truncation indicator if needed."""
+        if content is None:
+            print(f"[ProfilingWorker] {label}: None")
+            return
+        
+        content_len = len(content)
+        print(f"[ProfilingWorker] {label} ({content_len} chars):")
+        if content_len > max_chars:
+            print(content[:max_chars])
+            print(f"  ... (truncated, {content_len - max_chars} more chars)")
+        else:
+            print(content)
+
     def _clear_triton_cache(self):
         """Clear Triton cache to prevent compilation state pollution between runs."""
         triton_cache = os.path.expanduser("~/.triton/cache")
@@ -169,7 +187,7 @@ class ProfilingWorker:
                 print(f"[ProfilingWorker] WARNING: Could not clear Triton cache: {e}")
         
         # Also set TRITON_CACHE_DIR to isolate cache for this worker
-        unique_cache_dir = f"/tmp/triton_cache_gpu{self.gpu_id}_{os.getpid()}"
+        unique_cache_dir = self._get_triton_cache_dir()
         os.environ["TRITON_CACHE_DIR"] = unique_cache_dir
         os.makedirs(unique_cache_dir, exist_ok=True)
 
@@ -453,7 +471,7 @@ class ProfilingWorker:
         env["CUDA_VISIBLE_DEVICES"] = str(self.gpu_id)
         
         # Set TRITON_CACHE_DIR to isolate cache
-        unique_cache_dir = f"/tmp/triton_cache_gpu{self.gpu_id}_{os.getpid()}"
+        unique_cache_dir = self._get_triton_cache_dir()
         env["TRITON_CACHE_DIR"] = unique_cache_dir
 
         # Clear CUDA cache before running to avoid memory conflicts after NCU profiling
@@ -494,14 +512,9 @@ class ProfilingWorker:
             stderr = result.stderr
             
             # Print full stdout and stderr for debugging
-            print(f"[ProfilingWorker] STDOUT ({len(stdout)} chars):")
-            print(stdout[:2000] if len(stdout) > 2000 else stdout)
-            if len(stdout) > 2000:
-                print(f"  ... (truncated, {len(stdout) - 2000} more chars)")
-            
+            self._print_truncated_output(stdout, "STDOUT")
             if stderr:
-                print(f"[ProfilingWorker] STDERR ({len(stderr)} chars):")
-                print(stderr[:2000] if len(stderr) > 2000 else stderr)
+                self._print_truncated_output(stderr, "STDERR")
             
             metric = self._parse_vllm_bench_output(stdout, user_goal)
             print(f"[ProfilingWorker] Throughput validation result: {metric} tokens/sec")
@@ -513,18 +526,9 @@ class ProfilingWorker:
 
         except subprocess.CalledProcessError as e:
             print(f"[ProfilingWorker] ERROR: vllm bench failed. Return code: {e.returncode}")
-            # Print full stderr (increased from 500 to 2000 chars)
-            if e.stderr:
-                print(f"[ProfilingWorker] STDERR ({len(e.stderr)} chars):")
-                print(e.stderr[:2000] if len(e.stderr) > 2000 else e.stderr)
-                if len(e.stderr) > 2000:
-                    print(f"  ... (truncated, {len(e.stderr) - 2000} more chars)")
-            else:
-                print("[ProfilingWorker] STDERR: None")
-            # Also print stdout for debugging
-            if e.stdout:
-                print(f"[ProfilingWorker] STDOUT ({len(e.stdout)} chars):")
-                print(e.stdout[:2000] if len(e.stdout) > 2000 else e.stdout)
+            # Print full stderr and stdout for debugging
+            self._print_truncated_output(e.stderr, "STDERR")
+            self._print_truncated_output(e.stdout, "STDOUT")
             if os.path.exists(config_path):
                 os.remove(config_path)
             return 0.0
