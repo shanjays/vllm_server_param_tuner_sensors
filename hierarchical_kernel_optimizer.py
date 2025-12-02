@@ -154,9 +154,11 @@ L2 Cache Hit Rate: {stats(metrics['l2_hit_rate'])}"""
 
 def build_optimization_prompt(initial_ncu_report, feedback_collector=None):
     """
-    Build the optimization prompt with optional feedback from previous iterations.
+    Build the optimization prompt for direct kernel configuration generation.
     
-    Uses detailed expert-level prompt to encourage JSON-first output with brief reasoning.
+    The LLM directly generates specific kernel configurations to test, rather than
+    a search space for exploration. This enables faster iteration and better use
+    of LLM reasoning.
     
     Args:
         initial_ncu_report: Initial NCU profiling data (raw CSV)
@@ -176,7 +178,7 @@ def build_optimization_prompt(initial_ncu_report, feedback_collector=None):
     if feedback_collector:
         feedback_section = feedback_collector.format_feedback_for_prompt()
     
-    optimization_prompt = f'''You are an expert CUDA kernel optimization engineer specializing in NVIDIA GPU architectures and Triton kernel tuning. Your task is to generate an optimal configuration policy for the fused_moe (Mixture of Experts) kernel.
+    optimization_prompt = f'''You are an expert CUDA kernel optimization engineer specializing in NVIDIA GPU architectures and Triton kernel tuning. Your task is to generate specific kernel configurations to test for the fused_moe (Mixture of Experts) kernel.
 
 ═══════════════════════════════════════════════════════════════════════════════
                               KERNEL DETAILS
@@ -223,7 +225,7 @@ Analyze these metrics to determine if the kernel is compute-bound or memory-boun
                            TUNING PARAMETERS
 ═══════════════════════════════════════════════════════════════════════════════
 
-You must choose 2-3 values for each parameter:
+For each configuration, you must specify values for:
 
 1. BLOCK_SIZE_M - Tile size in M dimension
    Valid: [16, 32, 64, 128]
@@ -244,17 +246,6 @@ You must choose 2-3 values for each parameter:
 5. num_stages - Software pipelining stages
    Valid: [2, 3, 4, 5]
    More stages = better latency hiding (limited by shared memory)
-
-═══════════════════════════════════════════════════════════════════════════════
-                           OBJECTIVE WEIGHTS
-═══════════════════════════════════════════════════════════════════════════════
-
-Specify weights for the reward function (must sum to 1.0):
-
-- R_sm_throughput: SM compute efficiency (typical: 0.3-0.5)
-- R_dram_throughput: Memory bandwidth utilization (typical: 0.25-0.4)
-- R_l1_hit_rate: L1 cache efficiency (typical: 0.05-0.15)
-- R_l2_hit_rate: L2 cache efficiency (typical: 0.1-0.2)
 {feedback_section}
 ═══════════════════════════════════════════════════════════════════════════════
                            YOUR TASK
@@ -262,41 +253,47 @@ Specify weights for the reward function (must sum to 1.0):
 
 1. Analyze the baseline metrics above
 2. Determine if kernel is compute-bound or memory-bound
-3. Choose appropriate objective weights based on your analysis
-4. Select 2-3 promising values for each search_space parameter
-5. Output your policy JSON FIRST, then provide brief reasoning
+3. Generate 5-8 specific kernel configurations to test
+4. Each configuration should be complete with all 5 parameters
+5. Include brief reasoning for each configuration choice
 
 ═══════════════════════════════════════════════════════════════════════════════
                            OUTPUT FORMAT (IMPORTANT!)
 ═══════════════════════════════════════════════════════════════════════════════
 
 You MUST output in this EXACT format:
-1. FIRST: Output your policy JSON inside <param></param> tags
-2. THEN: Provide brief reasoning (2-4 sentences) explaining your choices
+1. FIRST: Output your configurations JSON inside <param></param> tags
+2. THEN: Provide brief reasoning (2-4 sentences) explaining your strategy
 
 <param>
 {{
-  "objective_weights": {{
-    "R_sm_throughput": <your_value>,
-    "R_dram_throughput": <your_value>,
-    "R_l1_hit_rate": <your_value>,
-    "R_l2_hit_rate": <your_value>
-  }},
-  "search_space": {{
-    "BLOCK_SIZE_M": [<2-3 values>],
-    "BLOCK_SIZE_N": [<2-3 values>],
-    "BLOCK_SIZE_K": [<2 values>],
-    "num_warps": [<2-3 values>],
-    "num_stages": [<2-3 values>]
-  }}
+  "configurations": [
+    {{
+      "BLOCK_SIZE_M": 64,
+      "BLOCK_SIZE_N": 128,
+      "BLOCK_SIZE_K": 32,
+      "num_warps": 8,
+      "num_stages": 4,
+      "reasoning": "Balanced config for medium batch sizes"
+    }},
+    {{
+      "BLOCK_SIZE_M": 128,
+      "BLOCK_SIZE_N": 64,
+      "BLOCK_SIZE_K": 64,
+      "num_warps": 16,
+      "num_stages": 3,
+      "reasoning": "High compute config for large batches"
+    }},
+    ... (5-8 configs total)
+  ]
 }}
 </param>
 
-REASONING: <Your brief 2-4 sentence explanation of why you chose these values>
+REASONING: <Your brief 2-4 sentence overall strategy explanation>
 
 ═══════════════════════════════════════════════════════════════════════════════
 
-NOW GENERATE YOUR OPTIMIZED POLICY (JSON first, then reasoning):
+NOW GENERATE YOUR KERNEL CONFIGURATIONS (JSON first, then reasoning):
 
 <param>
 '''

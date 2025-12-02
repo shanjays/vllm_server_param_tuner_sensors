@@ -5,21 +5,32 @@ import time
 import os
 import re
 import ast
-from kernel_tuning_env import KernelTuningEnvironment
-from exploration_agent import ExplorationAgent
 from profiling_worker import ProfilingWorker
 from config_exporter import TOKEN_COUNTS_ALL
 
 POWER_OF_TWO_WARPS = (2, 4, 8, 16, 32)
 
-# Default optimization policy with multiple options for PPO exploration
+# Default configurations for direct LLM-based testing
+# These are specific kernel configurations (not search spaces)
+DEFAULT_CONFIGURATIONS = [
+    {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 32, "num_warps": 8, "num_stages": 4},
+    {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 64, "num_warps": 16, "num_stages": 3},
+    {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32, "num_warps": 8, "num_stages": 5},
+    {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 32, "num_warps": 8, "num_stages": 3},
+    {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32, "num_warps": 4, "num_stages": 4},
+]
+
+# Default objective weights for reward computation
+DEFAULT_OBJECTIVE_WEIGHTS = {
+    "R_sm_throughput": 0.4,
+    "R_dram_throughput": 0.3,
+    "R_l1_hit_rate": 0.15,
+    "R_l2_hit_rate": 0.15
+}
+
+# Legacy support: DEFAULT_OPTIMIZATION_POLICY for backward compatibility
 DEFAULT_OPTIMIZATION_POLICY = {
-    "objective_weights": {
-        "R_sm_throughput": 0.4,
-        "R_dram_throughput": 0.3,
-        "R_l1_hit_rate": 0.15,
-        "R_l2_hit_rate": 0.15
-    },
+    "objective_weights": DEFAULT_OBJECTIVE_WEIGHTS,
     "search_space": {
         "BLOCK_SIZE_M": [32, 64, 128],
         "BLOCK_SIZE_N": [32, 64, 128],
@@ -41,27 +52,24 @@ TOKEN_COUNTS_TRAINING = [1, 16, 64, 256, 1024, 4096, 16384]
 # Default token counts to test (matching vLLM's expected format)
 DEFAULT_TOKEN_COUNTS = TOKEN_COUNTS_TRAINING
 
-# Minimum training steps per token count to ensure meaningful exploration
-MIN_STEPS_PER_TOKEN = 8  # Reduced from 10 for faster iteration
-
-# Number of top results to collect per token count
-RESULTS_PER_TOKEN = 3
+# Number of configurations to test per iteration
+CONFIGS_PER_ITERATION = 5
 
 # Validation frequency: run vLLM validation after every N token counts
 VALIDATE_EVERY_N_TOKENS = 3
 
 class MetaControllerReward:
     """
-    Meta-Controller Reward Function for hierarchical kernel optimization.
+    Meta-Controller Reward Function for direct LLM-based kernel optimization.
     
-    This class orchestrates the hierarchical optimization process by:
-    1. Parsing optimization policies from LLM outputs
-    2. Running exploration phases using PPO agents
+    This class orchestrates the optimization process by:
+    1. Parsing specific kernel configurations from LLM outputs
+    2. Testing each configuration directly via the ProfilingWorker
     3. Validating configurations through throughput benchmarks
-    4. Computing rewards to guide the meta-learning process
+    4. Computing rewards to guide the GRPO meta-learning process
     
-    The reward function bridges the high-level policy generation (LLM)
-    with the low-level configuration exploration (PPO agent).
+    The LLM directly generates specific configurations to test, rather than
+    generating a search space for a separate exploration agent.
     """
     def __init__(self, user_goal, model_name, exploration_steps, profiling_gpu_id, static_args, 
                  config_exporter=None, token_counts=None, training_logger=None, feedback_collector=None):
@@ -71,7 +79,7 @@ class MetaControllerReward:
         Args:
             user_goal: Optimization target ('throughput' or 'latency')
             model_name: Target model name for benchmarking
-            exploration_steps: Number of exploration steps per optimization round
+            exploration_steps: Number of configurations to test per iteration (legacy name kept for compatibility)
             profiling_gpu_id: GPU ID for the profiling worker
             static_args: Static benchmark arguments
             config_exporter: Optional VLLMConfigExporter for saving configs
@@ -140,45 +148,40 @@ class MetaControllerReward:
 
     def __call__(self, completions, **kwargs):
         rewards = []
-        for i, policy_str in enumerate(completions):
-            print(f"\n--- [MetaController] Processing Optimization Policy {i+1}/{len(completions)} ---")
+        for i, config_str in enumerate(completions):
+            print(f"\n--- [MetaController] Processing LLM Configuration {i+1}/{len(completions)} ---")
             
             # Debug output
-            print(f"[MetaController] DEBUG: Raw LLM Output:\n{policy_str}\n")
+            print(f"[MetaController] DEBUG: Raw LLM Output:\n{config_str}\n")
 
             valid = True
-            policy = None
+            configurations = None
             best_configs = {}
             try:
-                policy = self._extract_json(policy_str)
-                policy = self._clean_non_json_types(policy)
-                policy = self._validate_and_coerce_policy(policy)
+                parsed_output = self._extract_json(config_str)
+                parsed_output = self._clean_non_json_types(parsed_output)
+                configurations = self._validate_and_coerce_configurations(parsed_output)
 
-                path = f"temp_optimization_policy_{int(time.time())}_{i}.json"
-                with open(path, "w") as f:
-                    json.dump(policy, f, indent=2)
-
-                print(f"[MetaController] Starting exploration phase ({self.exploration_steps} steps)...")
-                top_configs, best_configs = self._run_exploration_phase(path)
+                print(f"[MetaController] Testing {len(configurations)} configurations directly...")
+                top_configs, best_configs = self._run_direct_testing_phase(configurations)
                 print(f"[MetaController] Starting throughput validation (Top {len(top_configs)} configs)...")
                 final_metric = self._run_throughput_validation(top_configs)
                 rewards.append(final_metric)
                 
-                # Record policy result to feedback collector
-                if self.feedback_collector and policy:
-                    self.feedback_collector.record_policy_result(
-                        policy=policy,
+                # Record configuration results to feedback collector
+                if self.feedback_collector and configurations:
+                    self.feedback_collector.record_configuration_results(
+                        configurations=configurations,
                         reward=final_metric,
                         best_configs=best_configs
                     )
                 
-                os.remove(path)
             except Exception as e:
                 valid = False
                 print(f"[MetaController] ERROR: Reward calculation failed. Reason: {e}")
                 rewards.append(0.0)
                 if not valid:
-                    self._run_default_penalty_policy(i)
+                    self._run_default_configurations(i)
         
         # Print training summary
         if self.config_exporter:
@@ -194,25 +197,17 @@ class MetaControllerReward:
 
     def _run_default_penalty_policy(self, idx):
         print("[MetaController] Policy failed. Running exploration phase on default policy to ensure training progression.")
-        default_policy = {
-            "objective_weights": {
-                "R_sm_throughput": 0.01,
-                "R_dram_throughput": 0.0,
-                "R_l1_hit_rate": 0.0,
-                "R_l2_hit_rate": 0.0
-            },
-            "search_space": DEFAULT_OPTIMIZATION_POLICY["search_space"].copy()
-        }
-        path = f"temp_default_policy_{int(time.time())}_{idx}.json"
+    def _run_default_configurations(self, idx):
+        """Run testing on default configurations when LLM output fails to parse."""
+        print("[MetaController] LLM output failed. Testing default configurations to ensure training progression.")
         try:
-            with open(path, "w") as f:
-                json.dump(default_policy, f, indent=2)
-            self._run_exploration_phase(path)
+            self._run_direct_testing_phase(DEFAULT_CONFIGURATIONS)
         except Exception as e:
-            print(f"[MetaController] WARNING: Default exploration phase also failed. {e}")
-        finally:
-            if os.path.exists(path):
-                os.remove(path)
+            print(f"[MetaController] WARNING: Default configuration testing also failed. {e}")
+
+    def _run_default_penalty_policy(self, idx):
+        """Legacy method for backward compatibility."""
+        self._run_default_configurations(idx)
 
     def _normalize_unicode(self, s: str) -> str:
         replacements = {
@@ -456,294 +451,327 @@ class MetaControllerReward:
                 return None
 
     def _default_safe_policy(self):
-        """Return a safe default policy with multiple options for exploration."""
+        """Return a safe default set of configurations for direct testing."""
         return {
-            "objective_weights": DEFAULT_OPTIMIZATION_POLICY["objective_weights"].copy(),
-            "search_space": {
-                k: list(v) for k, v in DEFAULT_OPTIMIZATION_POLICY["search_space"].items()
-            }
+            "configurations": [config.copy() for config in DEFAULT_CONFIGURATIONS]
         }
+
+    def _default_safe_configurations(self):
+        """Return a safe default list of configurations."""
+        return [config.copy() for config in DEFAULT_CONFIGURATIONS]
 
     def _default_safe_plan(self):
         """Legacy method for backward compatibility."""
         return self._default_safe_policy()
 
     def _try_salvage_policy(self, s: str):
-        """Try to salvage partial policy data from malformed output."""
-        rf_keys = ("R_sm_throughput", "R_dram_throughput", "R_l1_hit_rate", "R_l2_hit_rate")
-        pas_keys = ("BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K", "num_warps", "num_stages")
-        rf = {}
-        pas = {}
-        # Reward salvage for pattern key: [num, "desc"]
-        for k in rf_keys:
-            m = re.search(rf'{k}\s*[:=]\s*\[\s*([0-9eE+.\-]+)', s)
+        """Try to salvage partial configuration data from malformed output."""
+        # Try to extract individual configurations from the output
+        config_keys = ("BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K", "num_warps", "num_stages")
+        
+        # Check if we can find any configuration-like structures
+        configs = []
+        
+        # Try to find complete configurations
+        for k in config_keys:
+            pattern = rf'{k}\s*[:=]\s*([0-9]+)'
+            matches = re.findall(pattern, s)
+            if matches:
+                # Found some values, try to build a config
+                break
+        
+        # Try to extract one configuration from partial data
+        config = {}
+        for k in config_keys:
+            m = re.search(rf'{k}\s*[:=]\s*([0-9]+)', s)
             if m:
-                rf[k] = float(m.group(1))
-                continue
-            m2 = re.search(rf'{k}\s*[:=]\s*([0-9eE+.\-]+)', s)
-            if m2:
-                rf[k] = float(m2.group(1))
-        # Param salvage
-        for k in pas_keys:
-            m_list = re.search(rf'{k}\s*[:=]\s*\[([^\]]+)\]', s)
-            m_nums = re.search(rf'{k}\s*[:=]\s*([0-9][0-9,\s]*)', s)
-            values = []
-            src = None
-            if m_list:
-                src = m_list.group(1)
-            elif m_nums:
-                src = m_nums.group(1)
-            if src:
-                for tok in re.split(r'[,\s]+', src.strip()):
-                    if tok:
-                        try:
-                            values.append(int(tok))
-                        except Exception:
-                            pass
-                if values:
-                    pas[k] = values[:3]
-        if rf or pas:
-            for k in rf_keys:
-                rf.setdefault(k, 0.0)
-            for k in pas_keys:
-                if k not in pas:
-                    default = 64 if "BLOCK" in k else (32 if k == "BLOCK_SIZE_K" else 4)
-                    pas[k] = [default]
-            return {"objective_weights": rf, "search_space": pas}
+                try:
+                    config[k] = int(m.group(1))
+                except ValueError:
+                    pass
+        
+        if config:
+            # Fill in defaults for missing values
+            defaults = {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32, "num_warps": 8, "num_stages": 4}
+            for k in config_keys:
+                if k not in config:
+                    config[k] = defaults[k]
+            configs.append(config)
+        
+        if configs:
+            return {"configurations": configs}
         return None
 
     def _try_salvage_plan(self, s: str):
         """Legacy method for backward compatibility."""
         return self._try_salvage_policy(s)
 
-    def _validate_and_coerce_policy(self, policy):
-        """Validate and coerce the optimization policy, using defaults for missing/invalid values."""
-        # If policy is None or not a dict, use default
-        if policy is None or not isinstance(policy, dict):
-            print("[MetaController] WARNING: Invalid policy (None or not dict), using default optimization policy")
-            return {
-                "objective_weights": DEFAULT_OPTIMIZATION_POLICY["objective_weights"].copy(),
-                "search_space": {
-                    k: list(v) for k, v in DEFAULT_OPTIMIZATION_POLICY["search_space"].items()
-                }
-            }
+    def _validate_single_config(self, config):
+        """
+        Validate and coerce a single kernel configuration.
         
-        # Support both old and new key names for backward compatibility
-        if "objective_weights" in policy:
-            rf = policy.get("objective_weights", {})
-        else:
-            rf = policy.get("reward_function", {})
-        
-        if not isinstance(rf, dict):
-            rf = {}
-        
-        # If reward values are lists, take first numeric
-        def _scalar(v):
-            if isinstance(v, list):
-                for x in v:
-                    if isinstance(x, (int, float)):
-                        return float(x)
-                return 0.0
-            try:
-                return float(v)
-            except Exception:
-                return 0.0
-        
-        # Ensure all required reward keys are present
-        required_keys = ["R_sm_throughput", "R_dram_throughput", "R_l1_hit_rate", "R_l2_hit_rate"]
-        for k in required_keys:
-            rf[k] = _scalar(rf.get(k, DEFAULT_OPTIMIZATION_POLICY["objective_weights"].get(k, 0.0)))
-        
-        # Normalize weights to sum to 1.0 if total > 0
-        total = sum(rf.values())
-        if total > 0:
-            rf = {k: v / total for k, v in rf.items()}
-
-        # Support both old and new key names for search space
-        if "search_space" in policy:
-            ss = policy.get("search_space", {})
-        else:
-            ss = policy.get("pruned_action_space", {})
-        
-        if not isinstance(ss, dict) or not ss:
-            ss = {k: list(v) for k, v in DEFAULT_OPTIMIZATION_POLICY["search_space"].items()}
+        Args:
+            config: Dict with kernel parameters
             
-        def _coerce_list(v, default):
-            if isinstance(v, list):
-                out = []
-                for i in v:
-                    try:
-                        out.append(int(i))
-                    except Exception:
-                        continue
-                if not out:
-                    out = [default]
-                return out[:3]
-            try:
-                return [int(v)]
-            except Exception:
-                return [default]
+        Returns:
+            Validated config dict or None if invalid
+        """
+        if not isinstance(config, dict):
+            return None
         
-        # Get default values from DEFAULT_OPTIMIZATION_POLICY
-        ss["BLOCK_SIZE_M"] = _coerce_list(ss.get("BLOCK_SIZE_M", DEFAULT_OPTIMIZATION_POLICY["search_space"]["BLOCK_SIZE_M"]), 64)
-        ss["BLOCK_SIZE_N"] = _coerce_list(ss.get("BLOCK_SIZE_N", DEFAULT_OPTIMIZATION_POLICY["search_space"]["BLOCK_SIZE_N"]), 64)
-        ss["BLOCK_SIZE_K"] = _coerce_list(ss.get("BLOCK_SIZE_K", DEFAULT_OPTIMIZATION_POLICY["search_space"]["BLOCK_SIZE_K"]), 32)
-        ss["num_warps"]    = _coerce_list(ss.get("num_warps", DEFAULT_OPTIMIZATION_POLICY["search_space"]["num_warps"]), 4)
-        ss["num_stages"]   = _coerce_list(ss.get("num_stages", DEFAULT_OPTIMIZATION_POLICY["search_space"]["num_stages"]), 4)
-        # Enforce power-of-two warps
-        ss["num_warps"] = [w for w in ss["num_warps"] if w in POWER_OF_TWO_WARPS] or [4]
-        
-        # H100 hardware constraint validation - clamp values to safe limits
-        # Aggressive: Allow num_stages=5 for pushing boundaries!
-        H100_BLOCK_SIZE_MN_LIMIT = 128
-        H100_BLOCK_SIZE_K_LIMIT = 64
-        H100_NUM_STAGES_LIMIT = 5  # Increased from 4 for aggressive testing
-        
-        ss["BLOCK_SIZE_M"] = [min(v, H100_BLOCK_SIZE_MN_LIMIT) for v in ss["BLOCK_SIZE_M"]]
-        ss["BLOCK_SIZE_N"] = [min(v, H100_BLOCK_SIZE_MN_LIMIT) for v in ss["BLOCK_SIZE_N"]]
-        ss["BLOCK_SIZE_K"] = [min(v, H100_BLOCK_SIZE_K_LIMIT) for v in ss["BLOCK_SIZE_K"]]
-        ss["num_stages"] = [min(v, H100_NUM_STAGES_LIMIT) for v in ss["num_stages"]]
-        
-        # Remove duplicates and ensure non-empty lists
-        for key in ["BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K", "num_stages"]:
-            ss[key] = list(set(ss[key])) or ([64] if "BLOCK" in key else [4])
-        
-        # AFTER coercing all values, ensure minimum combinations
-        MIN_COMBINATIONS = 8  # Need at least 8 for meaningful PPO exploration
-        MIN_VALUES_PER_DIM = 2  # Each dimension needs at least 2 values
-        
-        # Default values to expand narrow search spaces
+        # Required parameters with defaults
         defaults = {
-            "BLOCK_SIZE_M": [64, 128],
-            "BLOCK_SIZE_N": [64, 128],
-            "BLOCK_SIZE_K": [32, 64],
-            "num_warps": [8, 16],
-            "num_stages": [3, 4, 5],
+            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_N": 64, 
+            "BLOCK_SIZE_K": 32,
+            "num_warps": 8,
+            "num_stages": 4
         }
         
-        # Ensure each dimension has at least 2 values
-        for key in ["BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K", "num_warps", "num_stages"]:
-            if len(ss[key]) < MIN_VALUES_PER_DIM:
-                # Merge with defaults, remove duplicates, limit to 3 values
-                # (consistent with _coerce_list which limits to 3 to keep search space manageable)
-                ss[key] = list(set(ss[key] + defaults[key]))[:3]
-                print(f"[MetaController] Expanded {key} to {ss[key]} (was too narrow)")
+        # H100 hardware constraints
+        H100_BLOCK_SIZE_MN_LIMIT = 128
+        H100_BLOCK_SIZE_K_LIMIT = 64
+        H100_NUM_STAGES_LIMIT = 5
         
-        # Calculate total combinations
-        total_combinations = 1
-        for values in ss.values():
-            total_combinations *= len(values)
+        validated = {}
         
-        if total_combinations < MIN_COMBINATIONS:
-            print(f"[MetaController] WARNING: Only {total_combinations} combinations, expanding search space")
-            # Use full default search space
-            ss = {k: list(v) for k, v in DEFAULT_OPTIMIZATION_POLICY["search_space"].items()}
-            total_combinations = 1
-            for values in ss.values():
-                total_combinations *= len(values)
+        # Extract and validate each parameter
+        for key, default_val in defaults.items():
+            val = config.get(key, default_val)
+            try:
+                val = int(val)
+            except (ValueError, TypeError):
+                val = default_val
+            validated[key] = val
         
-        print(f"[MetaController] Search space has {total_combinations} combinations")
+        # Apply hardware limits
+        validated["BLOCK_SIZE_M"] = min(max(16, validated["BLOCK_SIZE_M"]), H100_BLOCK_SIZE_MN_LIMIT)
+        validated["BLOCK_SIZE_N"] = min(max(32, validated["BLOCK_SIZE_N"]), H100_BLOCK_SIZE_MN_LIMIT)
+        validated["BLOCK_SIZE_K"] = min(max(32, validated["BLOCK_SIZE_K"]), H100_BLOCK_SIZE_K_LIMIT)
+        validated["num_stages"] = min(max(2, validated["num_stages"]), H100_NUM_STAGES_LIMIT)
         
-        return {"objective_weights": rf, "search_space": ss}
+        # Enforce power-of-two warps
+        num_warps = validated["num_warps"]
+        if num_warps not in POWER_OF_TWO_WARPS:
+            # Find nearest valid value
+            valid_warps = [w for w in POWER_OF_TWO_WARPS if w <= 32]
+            validated["num_warps"] = min(valid_warps, key=lambda x: abs(x - num_warps))
+        
+        # Optional: Include reasoning if present
+        if "reasoning" in config and isinstance(config["reasoning"], str):
+            validated["reasoning"] = config["reasoning"]
+        
+        return validated
+
+    def _validate_and_coerce_configurations(self, parsed_output):
+        """
+        Validate and coerce LLM output to a list of kernel configurations.
+        
+        Args:
+            parsed_output: Dict from LLM containing configurations
+            
+        Returns:
+            List of validated configuration dicts
+        """
+        if parsed_output is None or not isinstance(parsed_output, dict):
+            print("[MetaController] WARNING: Invalid output, using default configurations")
+            return self._default_safe_configurations()
+        
+        # Extract configurations list from parsed output
+        configs_raw = parsed_output.get("configurations", [])
+        
+        # Handle legacy format (objective_weights + search_space) for backward compatibility
+        if not configs_raw and ("objective_weights" in parsed_output or "search_space" in parsed_output):
+            print("[MetaController] Legacy format detected, generating configs from search space")
+            return self._generate_configs_from_search_space(parsed_output)
+        
+        if not isinstance(configs_raw, list) or not configs_raw:
+            print("[MetaController] WARNING: No configurations found, using defaults")
+            return self._default_safe_configurations()
+        
+        # Validate each configuration
+        validated_configs = []
+        for i, config in enumerate(configs_raw):
+            validated = self._validate_single_config(config)
+            if validated:
+                validated_configs.append(validated)
+                print(f"[MetaController] Config {i+1}: M={validated['BLOCK_SIZE_M']}, N={validated['BLOCK_SIZE_N']}, "
+                      f"K={validated['BLOCK_SIZE_K']}, warps={validated['num_warps']}, stages={validated['num_stages']}")
+        
+        if not validated_configs:
+            print("[MetaController] WARNING: No valid configurations after validation, using defaults")
+            return self._default_safe_configurations()
+        
+        # Limit to reasonable number of configs per iteration
+        max_configs = max(CONFIGS_PER_ITERATION, self.exploration_steps)
+        if len(validated_configs) > max_configs:
+            print(f"[MetaController] Limiting to {max_configs} configurations")
+            validated_configs = validated_configs[:max_configs]
+        
+        print(f"[MetaController] Validated {len(validated_configs)} configurations")
+        return validated_configs
+
+    def _generate_configs_from_search_space(self, policy):
+        """
+        Generate configurations from legacy search space format.
+        
+        Args:
+            policy: Dict with objective_weights and search_space
+            
+        Returns:
+            List of configuration dicts
+        """
+        search_space = policy.get("search_space", {})
+        if not search_space:
+            return self._default_safe_configurations()
+        
+        # Get parameter lists
+        m_vals = search_space.get("BLOCK_SIZE_M", [64])
+        n_vals = search_space.get("BLOCK_SIZE_N", [64])
+        k_vals = search_space.get("BLOCK_SIZE_K", [32])
+        warp_vals = search_space.get("num_warps", [8])
+        stage_vals = search_space.get("num_stages", [4])
+        
+        # Ensure lists
+        if not isinstance(m_vals, list): m_vals = [m_vals]
+        if not isinstance(n_vals, list): n_vals = [n_vals]
+        if not isinstance(k_vals, list): k_vals = [k_vals]
+        if not isinstance(warp_vals, list): warp_vals = [warp_vals]
+        if not isinstance(stage_vals, list): stage_vals = [stage_vals]
+        
+        # Generate configs (sample if too many combinations)
+        configs = []
+        import itertools
+        all_combos = list(itertools.product(m_vals, n_vals, k_vals, warp_vals, stage_vals))
+        
+        # Limit to max_configs
+        max_configs = max(CONFIGS_PER_ITERATION, self.exploration_steps)
+        if len(all_combos) > max_configs:
+            import random
+            all_combos = random.sample(all_combos, max_configs)
+        
+        for m, n, k, w, s in all_combos:
+            config = {
+                "BLOCK_SIZE_M": int(m),
+                "BLOCK_SIZE_N": int(n),
+                "BLOCK_SIZE_K": int(k),
+                "num_warps": int(w),
+                "num_stages": int(s)
+            }
+            validated = self._validate_single_config(config)
+            if validated:
+                configs.append(validated)
+        
+        return configs if configs else self._default_safe_configurations()
+
+    def _validate_and_coerce_policy(self, policy):
+        """Legacy method for backward compatibility - delegates to _validate_and_coerce_configurations."""
+        return self._validate_and_coerce_configurations(policy)
 
     def _validate_and_coerce_plan(self, plan):
         """Legacy method for backward compatibility."""
-        return self._validate_and_coerce_policy(plan)
+        return self._validate_and_coerce_configurations(plan)
 
-    def _run_exploration_phase(self, policy_config_path):
-        """Run exploration phase for EACH token count.
+    def _run_direct_testing_phase(self, configurations):
+        """
+        Directly test each configuration via the ProfilingWorker.
         
+        This replaces the PPO-based exploration with direct configuration testing.
+        The LLM suggests specific configs, and we test each one directly.
+        
+        Args:
+            configurations: List of kernel configuration dicts to test
+            
         Returns:
             Tuple of (top_configs, best_configs) where:
-            - top_configs: List of top configuration results
+            - top_configs: List of (config, state, reward) tuples for validation
             - best_configs: Dict mapping token_count -> {config, reward}
         """
-        all_top_results = []
-        best_configs_for_validation = []
+        all_results = []
         best_configs = {}
         total_tokens = len(self.token_counts)
-        
-        # Calculate steps per token count
-        steps_per_token = max(MIN_STEPS_PER_TOKEN, self.exploration_steps // len(self.token_counts))
+        total_configs = len(configurations)
         
         for i, token_count in enumerate(self.token_counts):
             print(f"\n[MetaController] === Token Count {i+1}/{total_tokens}: {token_count} tokens ===")
             
-            env = KernelTuningEnvironment(
-                policy_config_path=policy_config_path,
-                profiling_worker=self.worker,
-                static_args=self.static_args,
-                initial_state=self.initial_state,
-                config_exporter=self.config_exporter,
-                current_token_count=token_count
-            )
-            # Use persistent log_dir for each token count (not timestamped)
-            log_dir = f"./logs/exploration_agent/tokens_{token_count}/"
-            prev_cuda = os.environ.get("CUDA_VISIBLE_DEVICES")
-            
-            # Hide GPUs for SB3 MLP – force CPU
-            os.environ["CUDA_VISIBLE_DEVICES"] = "" 
-            agent = None
-            try:
-                # Create agent WITH loading existing model - THIS IS THE FIX!
-                agent = ExplorationAgent(
-                    env, 
-                    log_dir=log_dir, 
-                    device="cpu",
-                    load_existing=True,  # Load trained model if exists!
-                    training_logger=self.training_logger,
-                )
-                agent.train_epoch(steps=steps_per_token)
-                top = env.get_top_results(n=RESULTS_PER_TOKEN)
-                print(f"[MetaController] Token count {token_count}: Found {len(top)} results.")
-                all_top_results.extend(top)
-                best_configs_for_validation.extend(top)
+            token_results = []
+            for j, config in enumerate(configurations):
+                print(f"[MetaController] Testing config {j+1}/{total_configs}: "
+                      f"M={config['BLOCK_SIZE_M']}, N={config['BLOCK_SIZE_N']}, "
+                      f"K={config['BLOCK_SIZE_K']}, warps={config['num_warps']}, stages={config['num_stages']}")
                 
-                # Get best config from environment and save best model if improved
-                if top:
-                    best_result = max(top, key=lambda x: x[2])
-                    best_config = best_result[0]
-                    best_reward = best_result[2]
+                try:
+                    # Run profiling directly
+                    result_id = self.worker.run_kernel_profiling.remote(
+                        config, self.static_args, DEFAULT_OBJECTIVE_WEIGHTS, token_count
+                    )
+                    state, reward, csv_data = ray.get(result_id)
                     
-                    best_configs[token_count] = {
-                        'config': best_config,
-                        'reward': best_reward,
-                    }
-                    
-                    # Save best model if this is the best reward so far
-                    agent.save_best_if_improved(best_reward)
-                    
-                    # Update config exporter
-                    if self.config_exporter:
-                        self.config_exporter.update_best_config(
-                            token_count=token_count,
-                            config=best_config,
-                            reward=best_reward,
-                        )
-            finally:
-                if agent:
-                    try: agent.close()
-                    except Exception: pass
-                env.close()
-                if prev_cuda is None:
-                    os.environ.pop("CUDA_VISIBLE_DEVICES", None)
-                else:
-                    os.environ["CUDA_VISIBLE_DEVICES"] = prev_cuda
+                    if state is not None:
+                        result = (config, state, reward)
+                        token_results.append(result)
+                        all_results.append(result)
+                        
+                        # Update config exporter
+                        if self.config_exporter:
+                            metrics = {
+                                'sm_throughput': state[0],
+                                'dram_throughput': state[1],
+                                'l1_hit_rate': state[2],
+                                'l2_hit_rate': state[3]
+                            }
+                            self.config_exporter.update_best_config(
+                                token_count, config, reward, metrics
+                            )
+                        
+                        print(f"[MetaController] Result: reward={reward:.2f}, "
+                              f"SM={state[0]:.1f}%, DRAM={state[1]:.1f}%")
+                    else:
+                        print(f"[MetaController] Config failed (reward={reward:.2f})")
+                        
+                except Exception as e:
+                    print(f"[MetaController] ERROR testing config: {e}")
+                    continue
+            
+            # Track best config for this token count
+            if token_results:
+                best_result = max(token_results, key=lambda x: x[2])
+                best_configs[token_count] = {
+                    'config': best_result[0],
+                    'reward': best_result[2],
+                }
+                print(f"[MetaController] Best for {token_count} tokens: reward={best_result[2]:.2f}")
             
             # Periodic validation
-            if (i + 1) % VALIDATE_EVERY_N_TOKENS == 0 and best_configs_for_validation:
-                print(f"[MetaController] Running periodic throughput validation after {i+1} token counts...")
-                best_config = max(best_configs_for_validation, key=lambda x: x[2])
-                throughput = self._run_throughput_validation([best_config])
+            if (i + 1) % VALIDATE_EVERY_N_TOKENS == 0 and all_results:
+                print(f"[MetaController] Running periodic validation after {i+1} token counts...")
+                best_overall = max(all_results, key=lambda x: x[2])
+                throughput = self._run_throughput_validation([best_overall])
                 print(f"[MetaController] Periodic validation throughput: {throughput} tokens/sec")
-                best_configs_for_validation = []
         
-        # Return combined top results from all token counts along with best_configs
-        if all_top_results:
-            sorted_results = sorted(all_top_results, key=lambda x: x[2], reverse=True)
-            print(f"[MetaController] Exploration phase completed. Total {len(all_top_results)} results across {len(self.token_counts)} token counts.")
+        # Return top results sorted by reward
+        if all_results:
+            sorted_results = sorted(all_results, key=lambda x: x[2], reverse=True)
+            print(f"[MetaController] Direct testing complete. {len(all_results)} results across {len(self.token_counts)} token counts.")
             return sorted_results[:5], best_configs
+        
         return [], best_configs
+
+    def _run_exploration_phase(self, policy_config_path):
+        """
+        Legacy method for backward compatibility.
+        Converts policy file to configurations and runs direct testing.
+        """
+        try:
+            with open(policy_config_path, 'r') as f:
+                policy = json.load(f)
+            configurations = self._validate_and_coerce_configurations(policy)
+        except Exception as e:
+            print(f"[MetaController] WARNING: Could not load policy, using defaults: {e}")
+            configurations = self._default_safe_configurations()
+        
+        return self._run_direct_testing_phase(configurations)
 
     def _run_fast_loop(self, mission_plan_path):
         """Legacy method for backward compatibility."""

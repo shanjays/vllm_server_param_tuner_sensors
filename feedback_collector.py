@@ -119,6 +119,101 @@ class FeedbackCollector:
         
         # Persist state after each policy
         self._save_state()
+
+    def record_configuration_results(
+        self,
+        configurations: List[Dict[str, Any]],
+        reward: float,
+        best_configs: Optional[Dict[int, Dict[str, Any]]] = None
+    ) -> None:
+        """
+        Record results after testing LLM-generated configurations directly.
+        
+        This method is called when the LLM generates specific kernel configurations
+        to test, rather than a search space for PPO exploration.
+        
+        Args:
+            configurations: List of kernel configurations that were tested
+            reward: The overall reward achieved from the best configuration
+            best_configs: Optional dict mapping token_count -> {config, reward}
+        """
+        self.policies_evaluated += 1
+        
+        # Record in history with configuration format
+        self.policy_history.append({
+            "timestamp": datetime.now().isoformat(),
+            "policy_num": self.policies_evaluated,
+            "reward": reward,
+            "configurations": configurations,
+            "num_configs_tested": len(configurations),
+        })
+        
+        # Update best overall reward
+        if reward > self.best_overall_reward:
+            self.best_overall_reward = reward
+            # Analyze what made these configs successful
+            self._analyze_successful_configurations(configurations, reward)
+        
+        # Update best configs by token count
+        if best_configs:
+            for token_count, config_data in best_configs.items():
+                tc = int(token_count)
+                config = config_data.get("config", config_data)
+                config_reward = config_data.get("reward", reward)
+                
+                if tc not in self.best_configs_by_token or config_reward > self.best_configs_by_token[tc].get("reward", 0):
+                    self.best_configs_by_token[tc] = {
+                        "config": config,
+                        "reward": config_reward
+                    }
+        
+        # Persist state after each evaluation
+        self._save_state()
+
+    def _analyze_successful_configurations(self, configurations: List[Dict[str, Any]], reward: float) -> None:
+        """
+        Analyze what made these configurations successful.
+        
+        Args:
+            configurations: List of tested configurations
+            reward: The reward achieved
+        """
+        if not configurations:
+            return
+        
+        new_strategies = []
+        
+        # Analyze common patterns in successful configurations
+        for config in configurations:
+            block_m = config.get("BLOCK_SIZE_M", 0)
+            block_n = config.get("BLOCK_SIZE_N", 0)
+            num_stages = config.get("num_stages", 0)
+            num_warps = config.get("num_warps", 0)
+            
+            if block_m >= 128:
+                strategy = f"Large BLOCK_SIZE_M={block_m} improved throughput"
+                if strategy not in self.successful_strategies:
+                    new_strategies.append(strategy)
+            
+            if block_n >= 128:
+                strategy = f"Large BLOCK_SIZE_N={block_n} improved memory coalescing"
+                if strategy not in self.successful_strategies:
+                    new_strategies.append(strategy)
+            
+            if num_stages >= 4:
+                strategy = f"num_stages={num_stages} enabled effective prefetching"
+                if strategy not in self.successful_strategies:
+                    new_strategies.append(strategy)
+            
+            if num_warps >= 16:
+                strategy = f"High warp count ({num_warps}) improved occupancy"
+                if strategy not in self.successful_strategies:
+                    new_strategies.append(strategy)
+        
+        # Add new strategies (limit total to 6)
+        for strategy in new_strategies:
+            if len(self.successful_strategies) < 6:
+                self.successful_strategies.append(strategy)
     
     def _analyze_successful_strategy(self, policy: Dict[str, Any], reward: float) -> None:
         """
