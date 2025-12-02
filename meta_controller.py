@@ -5,6 +5,8 @@ import time
 import os
 import re
 import ast
+import itertools
+import random
 from profiling_worker import ProfilingWorker
 from config_exporter import TOKEN_COUNTS_ALL
 
@@ -195,8 +197,6 @@ class MetaControllerReward:
         
         return rewards
 
-    def _run_default_penalty_policy(self, idx):
-        print("[MetaController] Policy failed. Running exploration phase on default policy to ensure training progression.")
     def _run_default_configurations(self, idx):
         """Run testing on default configurations when LLM output fails to parse."""
         print("[MetaController] LLM output failed. Testing default configurations to ensure training progression.")
@@ -206,7 +206,12 @@ class MetaControllerReward:
             print(f"[MetaController] WARNING: Default configuration testing also failed. {e}")
 
     def _run_default_penalty_policy(self, idx):
-        """Legacy method for backward compatibility."""
+        """
+        Legacy method for backward compatibility.
+        
+        This method delegates to _run_default_configurations() which is the new 
+        implementation for the direct configuration testing architecture.
+        """
         self._run_default_configurations(idx)
 
     def _normalize_unicode(self, s: str) -> str:
@@ -641,13 +646,11 @@ class MetaControllerReward:
         
         # Generate configs (sample if too many combinations)
         configs = []
-        import itertools
         all_combos = list(itertools.product(m_vals, n_vals, k_vals, warp_vals, stage_vals))
         
         # Limit to max_configs
         max_configs = max(CONFIGS_PER_ITERATION, self.exploration_steps)
         if len(all_combos) > max_configs:
-            import random
             all_combos = random.sample(all_combos, max_configs)
         
         for m, n, k, w, s in all_combos:
@@ -706,7 +709,7 @@ class MetaControllerReward:
                     result_id = self.worker.run_kernel_profiling.remote(
                         config, self.static_args, DEFAULT_OBJECTIVE_WEIGHTS, token_count
                     )
-                    state, reward, csv_data = ray.get(result_id)
+                    state, reward, _ = ray.get(result_id)
                     
                     if state is not None:
                         result = (config, state, reward)

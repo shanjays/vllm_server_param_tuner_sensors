@@ -1,0 +1,19 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Generated config files from test runs
+optimized_configs/
+feedback_state.json
+initial_profile.csv
+
+# Training logs and checkpoints
+logs/
+hierarchical_optimizer_finetune/
+hierarchical_optimizer_final/
+
+# Temp files
+*.tmp
+temp_*.json

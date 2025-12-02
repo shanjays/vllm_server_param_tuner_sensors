@@ -132,24 +132,6 @@ def test_no_exploration_agent_usage():
         return False
 
 
-def test_config_exporter_update_in_direct_testing():
-    """Test that config_exporter.update_best_config is called during direct testing."""
-    print("\n=== Test: config_exporter updated during direct testing ===")
-    
-    source = get_meta_controller_source()
-    
-    # Check for config_exporter.update_best_config call
-    pattern = r'self\.config_exporter\.update_best_config\s*\('
-    match = re.search(pattern, source)
-    
-    if match:
-        print(f"✅ config_exporter.update_best_config is called")
-        return True
-    else:
-        print(f"❌ config_exporter.update_best_config NOT called")
-        return False
-
-
 def test_best_configs_tracked():
     """Test that best_configs dict is created to track configs."""
     print("\n=== Test: best_configs dict is tracked ===")
@@ -169,8 +151,8 @@ def test_best_configs_tracked():
 
 
 def test_config_exporter_updated():
-    """Test that config_exporter.update_best_config is called."""
-    print("\n=== Test: config_exporter.update_best_config called correctly ===")
+    """Test that config_exporter.update_best_config is called during direct testing."""
+    print("\n=== Test: config_exporter.update_best_config called ===")
     
     source = get_meta_controller_source()
     
@@ -322,7 +304,6 @@ if __name__ == "__main__":
     all_passed &= test_direct_testing_phase_exists()
     all_passed &= test_profiling_worker_used_for_testing()
     all_passed &= test_no_exploration_agent_usage()
-    all_passed &= test_config_exporter_update_in_direct_testing()
     
     all_passed &= test_best_configs_tracked()
     all_passed &= test_config_exporter_updated()
