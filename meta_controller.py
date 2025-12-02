@@ -786,6 +786,16 @@ class MetaControllerReward:
         if not top_configs:
             print("[MetaController] No valid configurations found for throughput validation.")
             return 0.0
+        
+        # Print summary of all configs to be tested before validation
+        print(f"\n[MetaController] === Throughput Validation Summary ===")
+        print(f"[MetaController] Testing {len(top_configs)} configurations:")
+        for i, (params, state, reward) in enumerate(top_configs):
+            print(f"  Config {i+1}: M={params.get('BLOCK_SIZE_M', 'N/A')}, "
+                  f"N={params.get('BLOCK_SIZE_N', 'N/A')}, K={params.get('BLOCK_SIZE_K', 'N/A')}, "
+                  f"warps={params.get('num_warps', 'N/A')}, stages={params.get('num_stages', 'N/A')}, "
+                  f"reward={reward:.2f}")
+        
         ids = [
             self.worker.run_throughput_validation.remote(params, self.model_name, self.user_goal)
             for params, state, reward in top_configs
@@ -814,6 +824,18 @@ class MetaControllerReward:
             print("[MetaController] No configs to validate.")
             return 0.0
         
+        # Print summary of all best configs by token count
+        print(f"\n[MetaController] === Combined Config Validation Summary ===")
+        print(f"[MetaController] Best configs for {len(best_configs_by_token)} token counts:")
+        for token_count in sorted(best_configs_by_token.keys(), key=lambda x: int(x) if isinstance(x, str) else x):
+            config_data = best_configs_by_token[token_count]
+            cfg = config_data.get("config", {})
+            reward = config_data.get("reward", 0)
+            print(f"  {token_count} tokens: M={cfg.get('BLOCK_SIZE_M', 'N/A')}, "
+                  f"N={cfg.get('BLOCK_SIZE_N', 'N/A')}, K={cfg.get('BLOCK_SIZE_K', 'N/A')}, "
+                  f"warps={cfg.get('num_warps', 'N/A')}, stages={cfg.get('num_stages', 'N/A')}, "
+                  f"reward={reward:.2f}")
+        
         # Build combined config with ALL token counts
         combined_config = {}
         for token_count, config_data in best_configs_by_token.items():
@@ -829,6 +851,11 @@ class MetaControllerReward:
             json.dump(combined_config, f, indent=2)
         
         print(f"[MetaController] Wrote combined config with {len(combined_config)} token counts to: {config_path}")
+        print(f"[MetaController] Config file contents preview:")
+        config_preview = json.dumps(combined_config, indent=2)
+        print(config_preview[:1000] if len(config_preview) > 1000 else config_preview)
+        if len(config_preview) > 1000:
+            print(f"  ... (truncated, {len(config_preview) - 1000} more chars)")
         
         # Now run vLLM benchmark ONCE (it will use the right config per token count internally)
         result = self.worker.run_throughput_validation.remote(

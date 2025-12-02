@@ -3,6 +3,7 @@ import subprocess
 import json
 import csv
 import os
+import shutil
 import numpy as np
 from io import StringIO
 import time
@@ -157,6 +158,21 @@ class ProfilingWorker:
         if len(self.failed_configs) > 100:
             self.failed_configs = self.failed_configs[-100:]
 
+    def _clear_triton_cache(self):
+        """Clear Triton cache to prevent compilation state pollution between runs."""
+        triton_cache = os.path.expanduser("~/.triton/cache")
+        if os.path.exists(triton_cache):
+            try:
+                shutil.rmtree(triton_cache, ignore_errors=True)
+                print(f"[ProfilingWorker] Cleared Triton cache: {triton_cache}")
+            except Exception as e:
+                print(f"[ProfilingWorker] WARNING: Could not clear Triton cache: {e}")
+        
+        # Also set TRITON_CACHE_DIR to isolate cache for this worker
+        unique_cache_dir = f"/tmp/triton_cache_gpu{self.gpu_id}_{os.getpid()}"
+        os.environ["TRITON_CACHE_DIR"] = unique_cache_dir
+        os.makedirs(unique_cache_dir, exist_ok=True)
+
     def run_kernel_profiling(self, params_dict, static_args, objective_weights, num_tokens=None):
         """
         Execute kernel profiling with the given configuration.
@@ -193,6 +209,9 @@ class ProfilingWorker:
                 return None, PENALTY_SHARED_MEMORY, None
             config_to_use = reduced_config
             print(f"[ProfilingWorker] Using reduced config: {config_to_use}")
+        
+        # Clear Triton cache before each profiling run to prevent compilation state pollution
+        self._clear_triton_cache()
         
         last_error = None
         last_stderr = None
@@ -355,13 +374,20 @@ class ProfilingWorker:
         inference throughput tests with vLLM.
         
         Args:
-            params_dict: Kernel configuration parameters
+            params_dict: Kernel configuration parameters. Can be either:
+                - A single config dict with kernel parameters
+                - A dict mapping token counts to config dicts (e.g., {"1": {...}, "16": {...}})
             model_name: Name of the model to benchmark
             user_goal: Optimization goal ('throughput' or 'latency')
             
         Returns:
             float: Throughput metric in tokens/sec
         """
+        print(f"[ProfilingWorker] Starting throughput validation on GPU {self.gpu_id}")
+        
+        # Clear Triton cache before validation to prevent compilation state pollution
+        self._clear_triton_cache()
+        
         try:
             import vllm
         except ImportError:
@@ -381,21 +407,54 @@ class ProfilingWorker:
         config_filename = f"E={E},N={N},device_name=NVIDIA_H100_80GB_HBM3.json" 
         config_path = os.path.join(self.vllm_config_dir, config_filename)
         
-        vllm_config_data = { 
-            "16088": params_dict, 
-            "default": params_dict  
-        }
+        # Build vLLM config data - support both single config and multi-token config formats
+        if params_dict and isinstance(params_dict, dict):
+            # Check if this is a multi-token config (keys are numeric strings like "1", "16", etc.)
+            is_multi_token = all(
+                isinstance(k, str) and k.isdigit() 
+                for k in params_dict.keys()
+            ) if params_dict else False
+            
+            if is_multi_token:
+                # Already in multi-token format, use directly
+                vllm_config_data = params_dict.copy()
+                print(f"[ProfilingWorker] Using multi-token config with {len(vllm_config_data)} token counts")
+            else:
+                # Single config - use for default and a representative token count
+                vllm_config_data = {
+                    "1": params_dict,
+                    "16": params_dict, 
+                    "64": params_dict,
+                    "256": params_dict,
+                    "1024": params_dict,
+                    "4096": params_dict,
+                    "16384": params_dict,
+                }
+                print(f"[ProfilingWorker] Expanded single config to {len(vllm_config_data)} token counts")
+        else:
+            print("[ProfilingWorker] WARNING: Invalid params_dict, using empty config")
+            vllm_config_data = {}
         
+        # Write config file with debug output
         try:
             with open(config_path, "w") as f:
                 json.dump(vllm_config_data, f, indent=2)
-            print(f"[ProfilingWorker] Wrote config to vLLM default path: {config_path}")
+            print(f"[ProfilingWorker] Wrote config to vLLM path: {config_path}")
+            print(f"[ProfilingWorker] Config file contents ({len(vllm_config_data)} entries):")
+            for tc, cfg in list(vllm_config_data.items())[:3]:  # Show first 3 entries
+                print(f"  {tc}: {cfg}")
+            if len(vllm_config_data) > 3:
+                print(f"  ... and {len(vllm_config_data) - 3} more entries")
         except Exception as e:
             print(f"[ProfilingWorker] ERROR: Failed to write vLLM config file. {e}")
             return 0.0
             
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = str(self.gpu_id)
+        
+        # Set TRITON_CACHE_DIR to isolate cache
+        unique_cache_dir = f"/tmp/triton_cache_gpu{self.gpu_id}_{os.getpid()}"
+        env["TRITON_CACHE_DIR"] = unique_cache_dir
 
         # Clear CUDA cache before running to avoid memory conflicts after NCU profiling
         try:
@@ -405,21 +464,24 @@ class ProfilingWorker:
         except Exception:
             pass
 
-        # Aggressive settings for maximum throughput testing
+        # vLLM benchmark command - compatible with vLLM 0.11.x
+        # Use benchmark_throughput script directly for better compatibility
         command = [
-            "python", "-m", "vllm.entrypoints.cli.main", "bench", "throughput",
+            "python", "-m", "vllm.benchmarks.benchmark_throughput",
             "--model", model_name,
-            "--dataset-path", "ShareGPT_Vicuna_unfiltered.json", 
-            "--num-prompts", "40",              # Reduced from 100 for faster iterations
+            "--input-len", "512",
+            "--output-len", "128",
+            "--num-prompts", "40",
             "--trust-remote-code",
             "--enforce-eager", 
             "--tensor-parallel-size", "1",
-            "--max-model-len", "4096",
-            "--gpu-memory-utilization", "0.90",  # Aggressive (was 0.85)
         ]
         
+        # Print full command for debugging
+        print(f"[ProfilingWorker] Full command: {' '.join(command)}")
+        print(f"[ProfilingWorker] Environment: CUDA_VISIBLE_DEVICES={self.gpu_id}, TRITON_CACHE_DIR={unique_cache_dir}")
+        
         try:
-            print(f"[ProfilingWorker] Running throughput validation: {' '.join(command)}")
             result = subprocess.run(
                 command, 
                 env=env, 
@@ -428,9 +490,20 @@ class ProfilingWorker:
                 text=True, 
                 timeout=600  # Increased timeout for model loading
             )
-            output = result.stdout
+            stdout = result.stdout
+            stderr = result.stderr
             
-            metric = self._parse_vllm_bench_output(output, user_goal)
+            # Print full stdout and stderr for debugging
+            print(f"[ProfilingWorker] STDOUT ({len(stdout)} chars):")
+            print(stdout[:2000] if len(stdout) > 2000 else stdout)
+            if len(stdout) > 2000:
+                print(f"  ... (truncated, {len(stdout) - 2000} more chars)")
+            
+            if stderr:
+                print(f"[ProfilingWorker] STDERR ({len(stderr)} chars):")
+                print(stderr[:2000] if len(stderr) > 2000 else stderr)
+            
+            metric = self._parse_vllm_bench_output(stdout, user_goal)
             print(f"[ProfilingWorker] Throughput validation result: {metric} tokens/sec")
             
             # Clean up config file
@@ -440,7 +513,18 @@ class ProfilingWorker:
 
         except subprocess.CalledProcessError as e:
             print(f"[ProfilingWorker] ERROR: vllm bench failed. Return code: {e.returncode}")
-            print(f"[ProfilingWorker] STDERR: {e.stderr[:500] if e.stderr else 'None'}")
+            # Print full stderr (increased from 500 to 2000 chars)
+            if e.stderr:
+                print(f"[ProfilingWorker] STDERR ({len(e.stderr)} chars):")
+                print(e.stderr[:2000] if len(e.stderr) > 2000 else e.stderr)
+                if len(e.stderr) > 2000:
+                    print(f"  ... (truncated, {len(e.stderr) - 2000} more chars)")
+            else:
+                print("[ProfilingWorker] STDERR: None")
+            # Also print stdout for debugging
+            if e.stdout:
+                print(f"[ProfilingWorker] STDOUT ({len(e.stdout)} chars):")
+                print(e.stdout[:2000] if len(e.stdout) > 2000 else e.stdout)
             if os.path.exists(config_path):
                 os.remove(config_path)
             return 0.0
@@ -453,6 +537,8 @@ class ProfilingWorker:
             
         except Exception as e:
             print(f"[ProfilingWorker] ERROR: vllm bench failed with exception: {e}")
+            import traceback
+            traceback.print_exc()
             if os.path.exists(config_path):
                 os.remove(config_path)
             return 0.0
